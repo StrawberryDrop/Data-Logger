@@ -1,0 +1,184 @@
+#include <SD.h>
+#include <RTClib.h>
+#include <SparkFunLSM6DS3.h>
+#include <Adafruit_LSM6DS3TRC.h>
+#include <DHTesp.h>
+#include <SPI.h>
+
+#define CS_PIN 5
+#define DHTTYPE DHTesp::DHT11
+#define DHT_PIN 15
+#define IMU_PIN 4
+
+DHTesp dhtSensor;
+String words, temperatureString;
+String gyroString = " ";
+RTC_DS1307 rtc;
+const char days[7][12] = {"Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"};
+
+File myFile;
+//LSM6DS3 imu(SPI_MODE, IMU_PIN);
+Adafruit_LSM6DS3TRC lsm6ds3trc;
+
+const TickType_t COLLECTION_PERIOD = 3000 / portTICK_PERIOD_MS;
+
+TaskHandle_t clockTask, cycleTask, sdTask, USERtask, gyrotask, tempTask;
+SemaphoreHandle_t sdSemmy;
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(CS_PIN, OUTPUT);
+  pinMode(IMU_PIN, OUTPUT);
+
+  delay(1000);
+  pinMode(17, OUTPUT);
+  dhtSensor.setup(DHT_PIN, DHTTYPE);
+  if (!rtc.begin()) {
+    Serial.println("Couldn't find RTC");
+    while (true);
+  }
+  Serial.println("found RTC");
+  rtc.adjust(DateTime(__DATE__, __TIME__));
+  
+  digitalWrite(CS_PIN, LOW);
+  digitalWrite(IMU_PIN, HIGH);
+  if (!SD.begin(CS_PIN)) {
+    Serial.println("Couldn't find SD");
+    while (true);
+  }
+  Serial.println("found SD");
+
+  digitalWrite(CS_PIN, HIGH);
+   digitalWrite(IMU_PIN, LOW);
+
+   if (!lsm6ds3trc.begin_I2C()) {
+    Serial.println("Failed to find LSM6DS3TR-C chip");
+    while (1) {
+      delay(10);
+    }
+  }
+
+  Serial.println("LSM6DS3 Found!");
+
+  sdSemmy = xSemaphoreCreateBinary();
+  xSemaphoreGive(sdSemmy);
+
+  xTaskCreatePinnedToCore(CycleTask, "One task to rule them all", configMINIMAL_STACK_SIZE, NULL, 1, &cycleTask, 0);
+  xTaskCreatePinnedToCore(ClockTask, "clock", configMINIMAL_STACK_SIZE * 2, NULL, 1, &clockTask, 0);
+  xTaskCreatePinnedToCore(TemperatureTask, "temp", configMINIMAL_STACK_SIZE * 5, NULL, 1, &tempTask, 0);
+  xTaskCreatePinnedToCore(Gyroscopetask, "spinny", configMINIMAL_STACK_SIZE * 3, NULL, 1, &gyrotask, 0);
+  xTaskCreatePinnedToCore(SDTask, "sd", configMINIMAL_STACK_SIZE * 3, NULL, 1, &sdTask, 0);
+  xTaskCreatePinnedToCore(USER_Task, "user input", configMINIMAL_STACK_SIZE * 4, NULL, 1, &USERtask, 1);
+}
+
+void loop() {
+  vTaskDelay(10 / portTICK_PERIOD_MS);
+}
+
+void CycleTask(void* parameters) {
+  vTaskDelay(10 / portTICK_PERIOD_MS);
+
+  TickType_t start = xTaskGetTickCount();
+  while (true) {
+    Serial.println();
+    vTaskResume(clockTask);
+    vTaskDelayUntil(&start, COLLECTION_PERIOD);
+  }
+}
+
+void ClockTask(void* parameters) {
+  while (true) {
+    vTaskSuspend(clockTask);
+    digitalWrite(17, HIGH);
+    vTaskDelay(50 / portTICK_PERIOD_MS);
+    digitalWrite(17, LOW);
+    Serial.println("Clock");
+    DateTime now = rtc.now();
+    //words = "Date: " + now.timestamp(DateTime::TIMESTAMP_DATE) + "\nTime: " + now.timestamp(DateTime::TIMESTAMP_TIME);
+    words = "Date: " + now.timestamp(DateTime::TIMESTAMP_DATE) + "\nTime: " + now.hour() + "hrs : " + now.minute() + "mins : "+  now.second() + "secs";
+    vTaskResume(tempTask);
+  }
+}
+
+void TemperatureTask(void *parameters) {
+  while (true) {
+    vTaskSuspend(tempTask);
+    Serial.println("Temperature ");
+    float temperature = dhtSensor.getTemperature();
+    float humidity = dhtSensor.getHumidity();
+
+    // Check if any reads failed and exit early (to try again).
+    if (isnan(temperature) || isnan(humidity)) {
+      temperatureString = "Error";
+    } else {
+      temperatureString = "Humidity: " + String(humidity, 2) + " Temperature: " + String(temperature, 2) + "Â°C";
+    }
+    vTaskResume(gyrotask);
+  }
+  
+}
+
+void Gyroscopetask(void *parameters) {
+  while (true) {
+    vTaskSuspend(gyrotask);
+    Serial.println("Gyroscope");
+    sensors_event_t accel;
+    sensors_event_t gyro;
+    sensors_event_t temp;
+    lsm6ds3trc.getEvent(&accel, &gyro, &temp);
+
+    gyroString = "Acceleration X: " + String(accel.acceleration.x) + " Y: " + String(accel.acceleration.y) + " Z: " + String(accel.acceleration.z) + "m/s^2\n";
+    gyroString += "Rotation X: " + String(gyro.gyro.x) + " Y: " + String(gyro.gyro.y) + " Z: " + String(gyro.gyro.z) + " rad/s\n";
+    
+    vTaskResume(sdTask);
+  }
+}
+
+void SDTask(void* parameters) {
+  while (true) {
+    vTaskSuspend(sdTask);
+    Serial.println("SD card");
+    xSemaphoreTake(sdSemmy, portMAX_DELAY);
+    myFile = SD.open("/test.txt", FILE_APPEND);
+    if (!myFile) {
+      Serial.println("File not found");
+      while (true);
+    }
+    myFile.println(words);
+    myFile.println(temperatureString);
+    myFile.println(gyroString);
+    myFile.close();
+    xSemaphoreGive(sdSemmy);
+  }
+}
+
+void USER_Task(void *parameters) {
+  String temp = "";
+  while (true) {
+    if (Serial.available()) {
+      vTaskDelay(10 / portTICK_PERIOD_MS);
+      while (Serial.available() > 1) {
+        temp += (char) Serial.read();
+      }
+      Serial.read();
+      //Serial.println(temp);
+      if (temp.equals("read")) {
+        xSemaphoreTake(sdSemmy, portMAX_DELAY);
+        Serial.println("\nFile contents:");
+        myFile = SD.open("/test.txt", FILE_READ);
+        for (int i = myFile.available(); i > 0; i--) {
+          Serial.print((char) myFile.read());
+        }
+        Serial.println("End file contents");
+        myFile.close();
+        xSemaphoreGive(sdSemmy);
+      } else if (temp.equals("clear")) {
+        xSemaphoreTake(sdSemmy, portMAX_DELAY);
+        SD.remove("/test.txt");
+        Serial.println("File cleared!");
+        xSemaphoreGive(sdSemmy);
+      }
+      temp = "";
+    }
+  }
+}
